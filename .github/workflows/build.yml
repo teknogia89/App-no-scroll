@@ -60,8 +60,8 @@ jobs:
                   applicationId = "com.example.noreels"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0"
+                  versionCode = 3
+                  versionName = "3.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -103,10 +103,9 @@ jobs:
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
               android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
-              android:accessibilityFlags="flagReportViewIds"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
               android:canRetrieveWindowContent="true"
               android:notificationTimeout="300"
-              android:packageNames="com.instagram.android,com.google.android.youtube"
               android:description="@string/service_description" />
           EOF
 
@@ -124,31 +123,77 @@ jobs:
           import android.view.accessibility.AccessibilityEvent;
           import android.view.accessibility.AccessibilityNodeInfo;
           import android.widget.Toast;
+          import java.util.Map;
           import java.util.Set;
+          import java.util.TreeMap;
           import java.util.TreeSet;
+          import java.util.concurrent.ConcurrentHashMap;
 
           public class ReelsBlockerService extends AccessibilityService {
               static volatile String dumpIg = "(belum ada data Instagram)";
               static volatile String dumpYt = "(belum ada data YouTube)";
-              private static final String IG = "com.instagram.android";
-              private static final String YT = "com.google.android.youtube";
+              static volatile boolean connected = false;
+              static volatile int totalEvents = 0;
+              static volatile int nullRoot = 0;
+              static volatile String lastError = "-";
+              static final Map<String, Integer> seen = new ConcurrentHashMap<>();
               private long lastRun = 0;
               private long lastBlock = 0;
               private int count = 0;
 
+              static String report() {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("v3 connected=").append(connected)
+                    .append(" events=").append(totalEvents)
+                    .append(" nullRoot=").append(nullRoot)
+                    .append("\nERR: ").append(lastError)
+                    .append("\nPKGS: ");
+                  int n = 0;
+                  for (Map.Entry<String, Integer> e : new TreeMap<>(seen).entrySet()) {
+                      if (n++ >= 40) break;
+                      sb.append(e.getKey()).append("=").append(e.getValue()).append(", ");
+                  }
+                  sb.append("\n\n").append(dumpIg).append("\n\n").append(dumpYt);
+                  return sb.toString();
+              }
+
+              @Override
+              protected void onServiceConnected() {
+                  super.onServiceConnected();
+                  connected = true;
+              }
+
               @Override
               public void onAccessibilityEvent(AccessibilityEvent event) {
+                  try {
+                      handle(event);
+                  } catch (Throwable t) {
+                      lastError = String.valueOf(t);
+                  }
+              }
+
+              private void handle(AccessibilityEvent event) {
                   if (event == null || event.getPackageName() == null) return;
                   String pkg = event.getPackageName().toString();
-                  boolean ig = pkg.equals(IG);
-                  boolean yt = pkg.equals(YT);
+                  totalEvents++;
+                  if (seen.size() < 200) {
+                      Integer c = seen.get(pkg);
+                      seen.put(pkg, c == null ? 1 : c + 1);
+                  }
+                  boolean yt = pkg.contains("youtube") && !pkg.contains("music");
+                  boolean ig = pkg.contains("instagram");
                   if (!ig && !yt) return;
+
                   long now = System.currentTimeMillis();
                   if (now - lastRun < 400) return;
                   lastRun = now;
 
                   AccessibilityNodeInfo root = getRootInActiveWindow();
-                  if (root == null) return;
+                  if (root == null) root = event.getSource();
+                  if (root == null) {
+                      nullRoot++;
+                      return;
+                  }
                   Set<String> ids = new TreeSet<>();
                   Set<String> sel = new TreeSet<>();
                   count = 0;
@@ -156,7 +201,8 @@ jobs:
                   root.recycle();
 
                   StringBuilder sb = new StringBuilder();
-                  sb.append(pkg).append("\nSELECTED: ").append(sel).append("\nIDS: ");
+                  sb.append(pkg).append(" nodes=").append(count)
+                    .append("\nSELECTED: ").append(sel).append("\nIDS: ");
                   for (String s : ids) sb.append(s).append(", ");
                   String dump = sb.toString();
                   if (dump.length() > 7000) dump = dump.substring(0, 7000);
@@ -221,24 +267,22 @@ jobs:
           import android.content.Intent;
           import android.os.Bundle;
           import android.provider.Settings;
-          import android.view.Gravity;
           import android.widget.Button;
           import android.widget.LinearLayout;
+          import android.widget.ScrollView;
           import android.widget.TextView;
           import android.widget.Toast;
 
           public class MainActivity extends Activity {
+              private TextView status;
+
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
+                  ScrollView scroll = new ScrollView(this);
                   LinearLayout layout = new LinearLayout(this);
                   layout.setOrientation(LinearLayout.VERTICAL);
-                  layout.setGravity(Gravity.CENTER);
-                  layout.setPadding(48, 48, 48, 48);
-                  TextView info = new TextView(this);
-                  info.setTextSize(16);
-                  info.setText("Aktifkan No Reels & Shorts di Pengaturan Aksesibilitas.");
-                  layout.addView(info);
+                  layout.setPadding(32, 48, 32, 48);
                   Button btn = new Button(this);
                   btn.setText("Buka Pengaturan Aksesibilitas");
                   btn.setOnClickListener(v ->
@@ -249,12 +293,22 @@ jobs:
                   copy.setOnClickListener(v -> {
                       ClipboardManager cm =
                           (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                      cm.setPrimaryClip(ClipData.newPlainText("dump",
-                          ReelsBlockerService.dumpIg + "\n\n" + ReelsBlockerService.dumpYt));
+                      cm.setPrimaryClip(ClipData.newPlainText("dump", ReelsBlockerService.report()));
                       Toast.makeText(this, "Tersalin", Toast.LENGTH_SHORT).show();
                   });
                   layout.addView(copy);
-                  setContentView(layout);
+                  status = new TextView(this);
+                  status.setTextSize(12);
+                  status.setTextIsSelectable(true);
+                  layout.addView(status);
+                  scroll.addView(layout);
+                  setContentView(scroll);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  status.setText(ReelsBlockerService.report());
               }
           }
           EOF
