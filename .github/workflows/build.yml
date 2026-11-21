@@ -60,8 +60,8 @@ jobs:
                   applicationId = "com.example.noreels"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 3
-                  versionName = "3.0"
+                  versionCode = 4
+                  versionName = "4.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -120,9 +120,20 @@ jobs:
           package com.example.noreels;
 
           import android.accessibilityservice.AccessibilityService;
+          import android.content.Intent;
+          import android.content.res.Configuration;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.util.DisplayMetrics;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.WindowManager;
           import android.view.accessibility.AccessibilityEvent;
           import android.view.accessibility.AccessibilityNodeInfo;
+          import android.view.accessibility.AccessibilityWindowInfo;
           import android.widget.Toast;
+          import java.util.ArrayList;
+          import java.util.List;
           import java.util.Map;
           import java.util.Set;
           import java.util.TreeMap;
@@ -137,13 +148,25 @@ jobs:
               static volatile int nullRoot = 0;
               static volatile String lastError = "-";
               static final Map<String, Integer> seen = new ConcurrentHashMap<>();
+
+              private final List<View> overlays = new ArrayList<>();
+              private String overlayKey = "";
               private long lastRun = 0;
               private long lastBlock = 0;
               private int count = 0;
 
+              private static class Found {
+                  Set<String> ids = new TreeSet<>();
+                  Set<String> sel = new TreeSet<>();
+                  Set<String> descs = new TreeSet<>();
+                  Set<String> texts = new TreeSet<>();
+                  List<String> tabInfo = new ArrayList<>();
+                  List<Rect> rects = new ArrayList<>();
+              }
+
               static String report() {
                   StringBuilder sb = new StringBuilder();
-                  sb.append("v3 connected=").append(connected)
+                  sb.append("v4 connected=").append(connected)
                     .append(" events=").append(totalEvents)
                     .append(" nullRoot=").append(nullRoot)
                     .append("\nERR: ").append(lastError)
@@ -164,6 +187,13 @@ jobs:
               }
 
               @Override
+              public boolean onUnbind(Intent intent) {
+                  clearOverlays();
+                  connected = false;
+                  return super.onUnbind(intent);
+              }
+
+              @Override
               public void onAccessibilityEvent(AccessibilityEvent event) {
                   try {
                       handle(event);
@@ -172,77 +202,131 @@ jobs:
                   }
               }
 
-              private void handle(AccessibilityEvent event) {
-                  if (event == null || event.getPackageName() == null) return;
-                  String pkg = event.getPackageName().toString();
-                  totalEvents++;
-                  if (seen.size() < 200) {
-                      Integer c = seen.get(pkg);
-                      seen.put(pkg, c == null ? 1 : c + 1);
+              private AccessibilityNodeInfo foregroundRoot() {
+                  List<AccessibilityWindowInfo> ws = getWindows();
+                  if (ws != null) {
+                      for (AccessibilityWindowInfo w : ws) {
+                          if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+                          if (w.isActive() || w.isFocused()) {
+                              AccessibilityNodeInfo r = w.getRoot();
+                              if (r != null) return r;
+                          }
+                      }
                   }
-                  boolean yt = pkg.contains("youtube") && !pkg.contains("music");
-                  boolean ig = pkg.contains("instagram");
-                  if (!ig && !yt) return;
+                  return getRootInActiveWindow();
+              }
 
+              private void handle(AccessibilityEvent event) {
+                  if (event == null) return;
+                  totalEvents++;
+                  CharSequence ep = event.getPackageName();
+                  if (ep != null && seen.size() < 200) {
+                      String k = ep.toString();
+                      Integer c = seen.get(k);
+                      seen.put(k, c == null ? 1 : c + 1);
+                  }
                   long now = System.currentTimeMillis();
                   if (now - lastRun < 400) return;
                   lastRun = now;
 
-                  AccessibilityNodeInfo root = getRootInActiveWindow();
-                  if (root == null) root = event.getSource();
+                  AccessibilityNodeInfo root = foregroundRoot();
                   if (root == null) {
                       nullRoot++;
+                      clearOverlays();
                       return;
                   }
-                  Set<String> ids = new TreeSet<>();
-                  Set<String> sel = new TreeSet<>();
+                  CharSequence rp = root.getPackageName();
+                  String pkg = rp == null ? "" : rp.toString();
+                  boolean yt = pkg.contains("youtube") && !pkg.contains("music");
+                  boolean ig = pkg.contains("instagram");
+                  if (!ig && !yt) {
+                      root.recycle();
+                      clearOverlays();
+                      return;
+                  }
+
+                  Found f = new Found();
                   count = 0;
-                  scan(root, 0, ids, sel);
+                  scan(root, 0, f);
                   root.recycle();
 
                   StringBuilder sb = new StringBuilder();
                   sb.append(pkg).append(" nodes=").append(count)
-                    .append("\nSELECTED: ").append(sel).append("\nIDS: ");
-                  for (String s : ids) sb.append(s).append(", ");
+                    .append("\nSELECTED: ").append(f.sel)
+                    .append("\nTABS: ").append(f.tabInfo)
+                    .append("\nDESCS: ").append(f.descs)
+                    .append("\nTEXTS: ").append(f.texts)
+                    .append("\nIDS: ");
+                  for (String s : f.ids) sb.append(s).append(", ");
                   String dump = sb.toString();
                   if (dump.length() > 7000) dump = dump.substring(0, 7000);
                   if (ig) dumpIg = dump; else dumpYt = dump;
 
+                  updateOverlays(f.rects, yt);
+
                   if (now - lastBlock < 1000) return;
-                  if (isReels(ig, ids, sel)) {
+                  if (isReels(ig, f)) {
                       lastBlock = now;
                       performGlobalAction(GLOBAL_ACTION_BACK);
                       Toast.makeText(this, "Reels/Shorts diblokir", Toast.LENGTH_SHORT).show();
                   }
               }
 
-              private void scan(AccessibilityNodeInfo node, int depth,
-                                Set<String> ids, Set<String> sel) {
+              private boolean isLabel(String s) {
+                  return s != null && (s.equalsIgnoreCase("reels") || s.equalsIgnoreCase("shorts"));
+              }
+
+              private Rect clickableBounds(AccessibilityNodeInfo node) {
+                  Rect r = new Rect();
+                  AccessibilityNodeInfo n = node;
+                  for (int i = 0; i < 5 && n != null; i++) {
+                      if (n.isClickable()) {
+                          n.getBoundsInScreen(r);
+                          return r;
+                      }
+                      n = n.getParent();
+                  }
+                  node.getBoundsInScreen(r);
+                  return r;
+              }
+
+              private void scan(AccessibilityNodeInfo node, int depth, Found f) {
                   if (node == null || depth > 45 || count > 2500) return;
                   count++;
                   String id = node.getViewIdResourceName();
                   if (id != null) {
                       int i = id.indexOf(":id/");
-                      ids.add(i >= 0 ? id.substring(i + 4) : id);
+                      f.ids.add(i >= 0 ? id.substring(i + 4) : id);
                   }
                   CharSequence d = node.getContentDescription();
-                  if (d != null && node.isSelected()) sel.add(d.toString());
+                  CharSequence t = node.getText();
+                  String ds = d == null ? null : d.toString().trim();
+                  String ts = t == null ? null : t.toString().trim();
+                  if (ds != null && ds.length() > 0 && ds.length() <= 30 && f.descs.size() < 80) f.descs.add(ds);
+                  if (ts != null && ts.length() > 0 && ts.length() <= 25 && f.texts.size() < 60) f.texts.add(ts);
+                  if (ds != null && ds.length() > 0 && node.isSelected()) f.sel.add(ds);
+                  if (isLabel(ds) || isLabel(ts)) {
+                      Rect r = clickableBounds(node);
+                      f.tabInfo.add((ds != null ? ds : ts) + " sel=" + node.isSelected()
+                          + " " + r.toShortString());
+                      if (!r.isEmpty()) f.rects.add(r);
+                  }
                   for (int c = 0; c < node.getChildCount(); c++) {
                       AccessibilityNodeInfo child = node.getChild(c);
                       if (child != null) {
-                          scan(child, depth + 1, ids, sel);
+                          scan(child, depth + 1, f);
                           child.recycle();
                       }
                   }
               }
 
-              private boolean isReels(boolean ig, Set<String> ids, Set<String> sel) {
-                  for (String s : sel) {
+              private boolean isReels(boolean ig, Found f) {
+                  for (String s : f.sel) {
                       String t = s.trim().toLowerCase();
                       if (ig && t.equals("reels")) return true;
                       if (!ig && t.equals("shorts")) return true;
                   }
-                  for (String id : ids) {
+                  for (String id : f.ids) {
                       String t = id.toLowerCase();
                       if (ig && t.startsWith("clips_viewer")) return true;
                       if (!ig && (t.startsWith("reel_player") || t.startsWith("reel_recycler")
@@ -250,6 +334,60 @@ jobs:
                               || t.startsWith("shorts_container"))) return true;
                   }
                   return false;
+              }
+
+              private void updateOverlays(List<Rect> rects, boolean yt) {
+                  DisplayMetrics dm = getResources().getDisplayMetrics();
+                  List<Rect> keep = new ArrayList<>();
+                  StringBuilder key = new StringBuilder();
+                  for (Rect r : rects) {
+                      if (r.isEmpty() || r.height() > dm.heightPixels * 0.2) continue;
+                      String k = r.toShortString();
+                      if (key.indexOf(k) >= 0) continue;
+                      key.append(k).append(";");
+                      keep.add(r);
+                  }
+                  String ks = key.toString();
+                  if (ks.equals(overlayKey)) return;
+                  clearOverlays();
+                  overlayKey = ks;
+                  boolean night = (getResources().getConfiguration().uiMode
+                          & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+                  int color = night ? (yt ? 0xFF0F0F0F : 0xFF000000) : 0xFFFFFFFF;
+                  WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  for (Rect r : keep) {
+                      View v = new View(this);
+                      v.setBackgroundColor(color);
+                      WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                              r.width(), r.height(),
+                              WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                              WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                      | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                      | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                              PixelFormat.OPAQUE);
+                      lp.gravity = Gravity.TOP | Gravity.LEFT;
+                      lp.x = r.left;
+                      lp.y = r.top;
+                      wm.addView(v, lp);
+                      overlays.add(v);
+                  }
+              }
+
+              private void clearOverlays() {
+                  if (overlays.isEmpty()) {
+                      overlayKey = "";
+                      return;
+                  }
+                  WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  for (View v : overlays) {
+                      try {
+                          wm.removeView(v);
+                      } catch (Throwable t) {
+                          lastError = String.valueOf(t);
+                      }
+                  }
+                  overlays.clear();
+                  overlayKey = "";
               }
 
               @Override
