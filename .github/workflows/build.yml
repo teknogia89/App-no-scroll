@@ -1,4 +1,4 @@
-name: Build APK
+name: Apk Anti Doom scroll
 
 on:
   workflow_dispatch:
@@ -60,8 +60,8 @@ jobs:
                   applicationId = "com.example.noreels"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 6
-                  versionName = "6.0"
+                  versionCode = 7
+                  versionName = "7.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -155,6 +155,7 @@ jobs:
               static volatile int polls = 0;
               static volatile int scans = 0;
               static volatile int blocks = 0;
+              static volatile long lastPollMs = 0;
               static volatile String lastError = "-";
               static final Map<String, Integer> seen = new ConcurrentHashMap<>();
               static final LinkedList<String> evLog = new LinkedList<>();
@@ -163,16 +164,20 @@ jobs:
               private HandlerThread worker;
               private Handler bg;
               private volatile boolean running = false;
+              private volatile long burstUntil = 0;
+              private volatile long lastTargetSeen = 0;
+              private volatile long lastKick = 0;
 
               private final List<View> overlays = new ArrayList<>();
               private String overlayKey = "";
-              private boolean hasOverlays = false;
 
+              private String lastKey = "";
               private long lastBlock = 0;
               private long streakStart = 0;
               private long pauseUntil = 0;
               private int blockStreak = 0;
               private long lastWin = 0;
+              private long lastDiag = 0;
               private int count = 0;
               private int skipped = 0;
 
@@ -183,8 +188,19 @@ jobs:
                   Set<String> descs = new TreeSet<>();
                   Set<String> texts = new TreeSet<>();
                   List<String> tabInfo = new ArrayList<>();
-                  List<Rect> rects = new ArrayList<>();
               }
+
+              private final Runnable pollOnce = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!running) return;
+                      try {
+                          poll();
+                      } catch (Throwable t) {
+                          lastError = String.valueOf(t);
+                      }
+                  }
+              };
 
               private final Runnable pollTask = new Runnable() {
                   @Override
@@ -195,17 +211,25 @@ jobs:
                       } catch (Throwable t) {
                           lastError = String.valueOf(t);
                       }
-                      if (running && bg != null) bg.postDelayed(this, 700);
+                      if (running && bg != null) bg.postDelayed(this, nextDelay());
                   }
               };
 
+              private long nextDelay() {
+                  long now = System.currentTimeMillis();
+                  if (now < burstUntil) return 150;
+                  if (now - lastTargetSeen < 5000) return 350;
+                  return 800;
+              }
+
               static String report() {
                   StringBuilder sb = new StringBuilder();
-                  sb.append("v6 connected=").append(connected)
+                  sb.append("v7 connected=").append(connected)
                     .append(" events=").append(totalEvents)
                     .append(" polls=").append(polls)
                     .append(" scans=").append(scans)
                     .append(" blocks=").append(blocks)
+                    .append(" lastPollMs=").append(lastPollMs)
                     .append("\nERR: ").append(lastError)
                     .append("\nWINS: ").append(winStr)
                     .append("\nPKGS: ");
@@ -255,12 +279,20 @@ jobs:
                           Integer c = seen.get(epk);
                           seen.put(epk, c == null ? 1 : c + 1);
                       }
-                      if (isTarget(epk)) {
+                      if (!isTarget(epk)) return;
+                      long now = System.currentTimeMillis();
+                      int type = event.getEventType();
+                      lastTargetSeen = now;
+                      if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                          burstUntil = now + 3000;
                           synchronized (evLog) {
-                              evLog.add("t" + event.getEventType() + " " + event.getClassName()
-                                  + " src=" + (event.getSource() != null));
+                              evLog.add("t" + type + " " + event.getClassName());
                               while (evLog.size() > 6) evLog.removeFirst();
                           }
+                      }
+                      if (bg != null && now - lastKick > 250) {
+                          lastKick = now;
+                          bg.post(pollOnce);
                       }
                   } catch (Throwable t) {
                       lastError = String.valueOf(t);
@@ -274,7 +306,7 @@ jobs:
 
               private void poll() {
                   polls++;
-                  long now = System.currentTimeMillis();
+                  final long now = System.currentTimeMillis();
                   List<AccessibilityWindowInfo> ws = getWindows();
                   boolean doWin = now - lastWin > 2000;
                   StringBuilder wsb = new StringBuilder();
@@ -285,6 +317,8 @@ jobs:
 
                   if (ws != null) {
                       for (AccessibilityWindowInfo w : ws) {
+                          boolean app = w.getType() == AccessibilityWindowInfo.TYPE_APPLICATION;
+                          if (!app && !doWin) continue;
                           AccessibilityNodeInfo r = w.getRoot();
                           String p = "null";
                           if (r != null) {
@@ -297,7 +331,6 @@ jobs:
                                  .append(w.isFocused() ? " F" : "")
                                  .append(" ").append(p).append("] ");
                           }
-                          boolean app = w.getType() == AccessibilityWindowInfo.TYPE_APPLICATION;
                           boolean match = r != null && app && isTarget(p);
                           if (app && w.isActive() && !match) otherActive = true;
                           if (match) {
@@ -318,58 +351,105 @@ jobs:
 
                   if (target == null || (otherActive && !targetActive)) {
                       if (target != null) target.recycle();
+                      if (lastKey.length() > 0) {
+                          lastKey = "";
+                          main.post(new Runnable() {
+                              @Override
+                              public void run() {
+                                  clearOverlays();
+                              }
+                          });
+                      }
+                      return;
+                  }
+                  lastTargetSeen = now;
+
+                  final boolean yt = tpkg.contains("youtube");
+                  final boolean ig = !yt;
+                  String pfx = tpkg + ":id/";
+                  boolean reels = false;
+                  List<Rect> rects = new ArrayList<>();
+
+                  if (ig) {
+                      List<AccessibilityNodeInfo> tab = target.findAccessibilityNodeInfosByViewId(pfx + "clips_tab");
+                      if (tab != null) {
+                          for (AccessibilityNodeInfo n : tab) {
+                              if (n.isSelected()) reels = true;
+                              addTabRect(n, rects);
+                              n.recycle();
+                          }
+                      }
+                      if (!reels) reels = anyVisible(target, pfx,
+                          new String[] {"clips_viewer_view_pager", "clips_viewer_video_layout"});
+                  } else {
+                      if (!reels) reels = anyVisible(target, pfx,
+                          new String[] {"reel_player_page_container", "reel_recycler"});
+                  }
+                  List<AccessibilityNodeInfo> labels = target.findAccessibilityNodeInfosByText(ig ? "Reels" : "Shorts");
+                  if (labels != null) {
+                      for (AccessibilityNodeInfo n : labels) {
+                          CharSequence d = n.getContentDescription();
+                          CharSequence t = n.getText();
+                          String ds = d == null ? null : d.toString().trim();
+                          String ts = t == null ? null : t.toString().trim();
+                          if (isLabel(ds) || isLabel(ts)) {
+                              if (selectedUp(n)) reels = true;
+                              addTabRect(n, rects);
+                          }
+                          n.recycle();
+                      }
+                  }
+
+                  if (now - lastDiag > 8000 && now >= burstUntil) {
+                      lastDiag = now;
+                      Found f = new Found();
+                      count = 0;
+                      skipped = 0;
+                      scan(target, 0, f);
+                      scans++;
+                      if (count >= 15) {
+                          StringBuilder sb = new StringBuilder();
+                          sb.append(tpkg).append(" nodes=").append(count).append(" hidden=").append(skipped)
+                            .append("\nSELECTED: ").append(f.sel)
+                            .append("\nSELIDS: ").append(f.selIds)
+                            .append("\nTABS: ").append(f.tabInfo)
+                            .append("\nDESCS: ").append(f.descs)
+                            .append("\nTEXTS: ").append(f.texts)
+                            .append("\nIDS: ");
+                          boolean hit = !f.tabInfo.isEmpty();
+                          for (String s : f.ids) {
+                              sb.append(s).append(", ");
+                              String l = s.toLowerCase();
+                              if (l.contains("reel") || l.contains("clips") || l.contains("short")) hit = true;
+                          }
+                          String dump = sb.toString();
+                          if (dump.length() > 6000) dump = dump.substring(0, 6000);
+                          if (ig) dumpIg = dump; else dumpYt = dump;
+                          if (hit) dumpHit = dump;
+                      }
+                      if (isReelsFull(ig, f)) reels = true;
+                  }
+                  target.recycle();
+
+                  StringBuilder key = new StringBuilder();
+                  for (Rect r : rects) key.append(r.toShortString()).append(";");
+                  String ks = key.toString();
+                  if (!ks.equals(lastKey)) {
+                      lastKey = ks;
+                      final List<Rect> copy = new ArrayList<>(rects);
                       main.post(new Runnable() {
                           @Override
                           public void run() {
-                              clearOverlays();
+                              try {
+                                  updateOverlays(copy, yt);
+                              } catch (Throwable t) {
+                                  lastError = String.valueOf(t);
+                              }
                           }
                       });
-                      return;
                   }
 
-                  final boolean yt = tpkg.contains("youtube");
-                  boolean ig = !yt;
-                  Found f = new Found();
-                  count = 0;
-                  skipped = 0;
-                  scan(target, 0, f);
-                  target.recycle();
-                  scans++;
-
-                  if (count >= 15) {
-                      StringBuilder sb = new StringBuilder();
-                      sb.append(tpkg).append(" nodes=").append(count).append(" hidden=").append(skipped)
-                        .append("\nSELECTED: ").append(f.sel)
-                        .append("\nSELIDS: ").append(f.selIds)
-                        .append("\nTABS: ").append(f.tabInfo)
-                        .append("\nDESCS: ").append(f.descs)
-                        .append("\nTEXTS: ").append(f.texts)
-                        .append("\nIDS: ");
-                      boolean hit = !f.tabInfo.isEmpty();
-                      for (String s : f.ids) {
-                          sb.append(s).append(", ");
-                          String l = s.toLowerCase();
-                          if (l.contains("reel") || l.contains("clips") || l.contains("short")) hit = true;
-                      }
-                      String dump = sb.toString();
-                      if (dump.length() > 6000) dump = dump.substring(0, 6000);
-                      if (ig) dumpIg = dump; else dumpYt = dump;
-                      if (hit) dumpHit = dump;
-                  }
-
-                  final List<Rect> copy = new ArrayList<>(f.rects);
-                  main.post(new Runnable() {
-                      @Override
-                      public void run() {
-                          try {
-                              updateOverlays(copy, yt);
-                          } catch (Throwable t) {
-                              lastError = String.valueOf(t);
-                          }
-                      }
-                  });
-
-                  if (now >= pauseUntil && now - lastBlock >= 1000 && isReels(ig, f)) {
+                  if (reels && now >= pauseUntil && now - lastBlock >= 600) {
                       lastBlock = now;
                       if (now - streakStart > 6000) {
                           streakStart = now;
@@ -381,16 +461,52 @@ jobs:
                           blockStreak = 0;
                       } else {
                           blocks++;
+                          performGlobalAction(GLOBAL_ACTION_BACK);
                           main.post(new Runnable() {
                               @Override
                               public void run() {
-                                  performGlobalAction(GLOBAL_ACTION_BACK);
                                   Toast.makeText(ReelsBlockerService.this, "Reels/Shorts diblokir",
                                       Toast.LENGTH_SHORT).show();
                               }
                           });
                       }
                   }
+                  lastPollMs = System.currentTimeMillis() - now;
+              }
+
+              private boolean anyVisible(AccessibilityNodeInfo root, String pfx, String[] ids) {
+                  for (String id : ids) {
+                      List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByViewId(pfx + id);
+                      if (nodes == null) continue;
+                      boolean found = false;
+                      for (AccessibilityNodeInfo n : nodes) {
+                          if (n.isVisibleToUser()) found = true;
+                          n.recycle();
+                      }
+                      if (found) return true;
+                  }
+                  return false;
+              }
+
+              private boolean selectedUp(AccessibilityNodeInfo n) {
+                  AccessibilityNodeInfo cur = n;
+                  for (int i = 0; i < 2 && cur != null; i++) {
+                      if (cur.isSelected()) return true;
+                      cur = cur.getParent();
+                  }
+                  return false;
+              }
+
+              private void addTabRect(AccessibilityNodeInfo n, List<Rect> out) {
+                  if (!n.isVisibleToUser()) return;
+                  DisplayMetrics dm = getResources().getDisplayMetrics();
+                  Rect r = clickableBounds(n);
+                  if (r.isEmpty()) return;
+                  if (r.top < dm.heightPixels * 0.8 || r.height() > dm.heightPixels * 0.2) return;
+                  for (Rect o : out) {
+                      if (o.equals(r)) return;
+                  }
+                  out.add(r);
               }
 
               private boolean isLabel(String s) {
@@ -436,10 +552,10 @@ jobs:
                       if (sid != null) f.selIds.add(sid);
                   }
                   if (isLabel(ds) || isLabel(ts)) {
-                      Rect r = clickableBounds(node);
+                      Rect r = new Rect();
+                      node.getBoundsInScreen(r);
                       f.tabInfo.add((ds != null ? ds : ts) + " sel=" + node.isSelected()
                           + " " + r.toShortString());
-                      if (!r.isEmpty()) f.rects.add(r);
                   }
                   for (int c = 0; c < node.getChildCount(); c++) {
                       AccessibilityNodeInfo child = node.getChild(c);
@@ -450,7 +566,7 @@ jobs:
                   }
               }
 
-              private boolean isReels(boolean ig, Found f) {
+              private boolean isReelsFull(boolean ig, Found f) {
                   for (String s : f.sel) {
                       String t = s.trim().toLowerCase();
                       if (ig && t.equals("reels")) return true;
@@ -502,13 +618,11 @@ jobs:
                       wm.addView(v, lp);
                       overlays.add(v);
                   }
-                  hasOverlays = !overlays.isEmpty();
               }
 
               private void clearOverlays() {
                   if (overlays.isEmpty()) {
                       overlayKey = "";
-                      hasOverlays = false;
                       return;
                   }
                   WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
@@ -521,7 +635,6 @@ jobs:
                   }
                   overlays.clear();
                   overlayKey = "";
-                  hasOverlays = false;
               }
 
               @Override
