@@ -60,8 +60,8 @@ jobs:
                   applicationId = "com.example.noreels"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 5
-                  versionName = "5.0"
+                  versionCode = 6
+                  versionName = "6.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -125,6 +125,9 @@ jobs:
           import android.content.res.Configuration;
           import android.graphics.PixelFormat;
           import android.graphics.Rect;
+          import android.os.Handler;
+          import android.os.HandlerThread;
+          import android.os.Looper;
           import android.util.DisplayMetrics;
           import android.view.Gravity;
           import android.view.View;
@@ -134,6 +137,7 @@ jobs:
           import android.view.accessibility.AccessibilityWindowInfo;
           import android.widget.Toast;
           import java.util.ArrayList;
+          import java.util.LinkedList;
           import java.util.List;
           import java.util.Map;
           import java.util.Set;
@@ -148,36 +152,60 @@ jobs:
               static volatile String winStr = "-";
               static volatile boolean connected = false;
               static volatile int totalEvents = 0;
-              static volatile int nullRoot = 0;
-              static volatile int srcNull = 0;
+              static volatile int polls = 0;
               static volatile int scans = 0;
+              static volatile int blocks = 0;
               static volatile String lastError = "-";
               static final Map<String, Integer> seen = new ConcurrentHashMap<>();
+              static final LinkedList<String> evLog = new LinkedList<>();
+
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private HandlerThread worker;
+              private Handler bg;
+              private volatile boolean running = false;
 
               private final List<View> overlays = new ArrayList<>();
               private String overlayKey = "";
-              private long lastRun = 0;
+              private boolean hasOverlays = false;
+
               private long lastBlock = 0;
-              private long lastAppEvent = 0;
+              private long streakStart = 0;
+              private long pauseUntil = 0;
+              private int blockStreak = 0;
               private long lastWin = 0;
               private int count = 0;
+              private int skipped = 0;
 
               private static class Found {
                   Set<String> ids = new TreeSet<>();
                   Set<String> sel = new TreeSet<>();
+                  Set<String> selIds = new TreeSet<>();
                   Set<String> descs = new TreeSet<>();
                   Set<String> texts = new TreeSet<>();
                   List<String> tabInfo = new ArrayList<>();
                   List<Rect> rects = new ArrayList<>();
               }
 
+              private final Runnable pollTask = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!running) return;
+                      try {
+                          poll();
+                      } catch (Throwable t) {
+                          lastError = String.valueOf(t);
+                      }
+                      if (running && bg != null) bg.postDelayed(this, 700);
+                  }
+              };
+
               static String report() {
                   StringBuilder sb = new StringBuilder();
-                  sb.append("v5 connected=").append(connected)
+                  sb.append("v6 connected=").append(connected)
                     .append(" events=").append(totalEvents)
+                    .append(" polls=").append(polls)
                     .append(" scans=").append(scans)
-                    .append(" nullRoot=").append(nullRoot)
-                    .append(" srcNull=").append(srcNull)
+                    .append(" blocks=").append(blocks)
                     .append("\nERR: ").append(lastError)
                     .append("\nWINS: ").append(winStr)
                     .append("\nPKGS: ");
@@ -185,6 +213,10 @@ jobs:
                   for (Map.Entry<String, Integer> e : new TreeMap<>(seen).entrySet()) {
                       if (n++ >= 40) break;
                       sb.append(e.getKey()).append("=").append(e.getValue()).append(", ");
+                  }
+                  sb.append("\nEVLOG: ");
+                  synchronized (evLog) {
+                      for (String s : evLog) sb.append(s).append(" | ");
                   }
                   sb.append("\n\nHIT: ").append(dumpHit);
                   sb.append("\n\n").append(dumpIg).append("\n\n").append(dumpYt);
@@ -195,108 +227,120 @@ jobs:
               protected void onServiceConnected() {
                   super.onServiceConnected();
                   connected = true;
+                  running = true;
+                  worker = new HandlerThread("noreels-poll");
+                  worker.start();
+                  bg = new Handler(worker.getLooper());
+                  bg.post(pollTask);
               }
 
               @Override
               public boolean onUnbind(Intent intent) {
-                  clearOverlays();
+                  running = false;
                   connected = false;
+                  if (bg != null) bg.removeCallbacksAndMessages(null);
+                  if (worker != null) worker.quitSafely();
+                  clearOverlays();
                   return super.onUnbind(intent);
               }
 
               @Override
               public void onAccessibilityEvent(AccessibilityEvent event) {
                   try {
-                      handle(event);
+                      if (event == null) return;
+                      totalEvents++;
+                      CharSequence ep = event.getPackageName();
+                      String epk = ep == null ? "" : ep.toString();
+                      if (epk.length() > 0 && seen.size() < 200) {
+                          Integer c = seen.get(epk);
+                          seen.put(epk, c == null ? 1 : c + 1);
+                      }
+                      if (isTarget(epk)) {
+                          synchronized (evLog) {
+                              evLog.add("t" + event.getEventType() + " " + event.getClassName()
+                                  + " src=" + (event.getSource() != null));
+                              while (evLog.size() > 6) evLog.removeFirst();
+                          }
+                      }
                   } catch (Throwable t) {
                       lastError = String.valueOf(t);
                   }
               }
 
-              private AccessibilityNodeInfo topOf(AccessibilityNodeInfo n) {
-                  AccessibilityNodeInfo cur = n;
-                  for (int i = 0; i < 80; i++) {
-                      AccessibilityNodeInfo p = cur.getParent();
-                      if (p == null) break;
-                      cur = p;
-                  }
-                  return cur;
+              private boolean isTarget(String p) {
+                  if (p == null) return false;
+                  return p.contains("instagram") || (p.contains("youtube") && !p.contains("music"));
               }
 
-              private String windowInfo() {
-                  StringBuilder sb = new StringBuilder();
-                  List<AccessibilityWindowInfo> ws = getWindows();
-                  if (ws == null) return "null";
-                  for (AccessibilityWindowInfo w : ws) {
-                      String p = "?";
-                      AccessibilityNodeInfo r = w.getRoot();
-                      if (r != null) {
-                          CharSequence cp = r.getPackageName();
-                          p = cp == null ? "?" : cp.toString();
-                          r.recycle();
-                      }
-                      sb.append("[t").append(w.getType())
-                        .append(w.isActive() ? " A" : "")
-                        .append(w.isFocused() ? " F" : "")
-                        .append(" ").append(p).append("] ");
-                  }
-                  return sb.toString();
-              }
-
-              private void handle(AccessibilityEvent event) {
-                  if (event == null) return;
-                  totalEvents++;
-                  CharSequence ep = event.getPackageName();
-                  String epk = ep == null ? "" : ep.toString();
-                  if (epk.length() > 0 && seen.size() < 200) {
-                      Integer c = seen.get(epk);
-                      seen.put(epk, c == null ? 1 : c + 1);
-                  }
-                  boolean yt = epk.contains("youtube") && !epk.contains("music");
-                  boolean ig = epk.contains("instagram");
+              private void poll() {
+                  polls++;
                   long now = System.currentTimeMillis();
+                  List<AccessibilityWindowInfo> ws = getWindows();
+                  boolean doWin = now - lastWin > 2000;
+                  StringBuilder wsb = new StringBuilder();
+                  AccessibilityNodeInfo target = null;
+                  String tpkg = "";
+                  boolean targetActive = false;
+                  boolean otherActive = false;
 
-                  if (!ig && !yt) {
-                      boolean stateChange =
-                          event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
-                      if ((stateChange && !epk.equals(getPackageName())
-                              && !epk.equals("com.android.systemui"))
-                              || now - lastAppEvent > 5000) {
-                          clearOverlays();
+                  if (ws != null) {
+                      for (AccessibilityWindowInfo w : ws) {
+                          AccessibilityNodeInfo r = w.getRoot();
+                          String p = "null";
+                          if (r != null) {
+                              CharSequence cp = r.getPackageName();
+                              p = cp == null ? "?" : cp.toString();
+                          }
+                          if (doWin) {
+                              wsb.append("[t").append(w.getType())
+                                 .append(w.isActive() ? " A" : "")
+                                 .append(w.isFocused() ? " F" : "")
+                                 .append(" ").append(p).append("] ");
+                          }
+                          boolean app = w.getType() == AccessibilityWindowInfo.TYPE_APPLICATION;
+                          boolean match = r != null && app && isTarget(p);
+                          if (app && w.isActive() && !match) otherActive = true;
+                          if (match) {
+                              if (w.isActive()) targetActive = true;
+                              if (target == null) {
+                                  target = r;
+                                  tpkg = p;
+                                  continue;
+                              }
+                          }
+                          if (r != null) r.recycle();
                       }
-                      return;
                   }
-                  lastAppEvent = now;
-                  if (now - lastRun < 400) return;
-                  lastRun = now;
+                  if (doWin) {
+                      lastWin = now;
+                      winStr = wsb.toString();
+                  }
 
-                  AccessibilityNodeInfo src = event.getSource();
-                  AccessibilityNodeInfo root;
-                  if (src != null) {
-                      root = topOf(src);
-                  } else {
-                      srcNull++;
-                      root = getRootInActiveWindow();
-                  }
-                  if (root == null) {
-                      nullRoot++;
+                  if (target == null || (otherActive && !targetActive)) {
+                      if (target != null) target.recycle();
+                      main.post(new Runnable() {
+                          @Override
+                          public void run() {
+                              clearOverlays();
+                          }
+                      });
                       return;
                   }
 
+                  final boolean yt = tpkg.contains("youtube");
+                  boolean ig = !yt;
                   Found f = new Found();
                   count = 0;
-                  scan(root, 0, f);
+                  skipped = 0;
+                  scan(target, 0, f);
+                  target.recycle();
                   scans++;
-
-                  if (now - lastWin > 3000) {
-                      lastWin = now;
-                      winStr = windowInfo();
-                  }
 
                   if (count >= 15) {
                       StringBuilder sb = new StringBuilder();
-                      sb.append(epk).append(" nodes=").append(count)
+                      sb.append(tpkg).append(" nodes=").append(count).append(" hidden=").append(skipped)
                         .append("\nSELECTED: ").append(f.sel)
+                        .append("\nSELIDS: ").append(f.selIds)
                         .append("\nTABS: ").append(f.tabInfo)
                         .append("\nDESCS: ").append(f.descs)
                         .append("\nTEXTS: ").append(f.texts)
@@ -313,12 +357,39 @@ jobs:
                       if (hit) dumpHit = dump;
                   }
 
-                  updateOverlays(f.rects, yt);
+                  final List<Rect> copy = new ArrayList<>(f.rects);
+                  main.post(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              updateOverlays(copy, yt);
+                          } catch (Throwable t) {
+                              lastError = String.valueOf(t);
+                          }
+                      }
+                  });
 
-                  if (now - lastBlock >= 1000 && isReels(ig, f)) {
+                  if (now >= pauseUntil && now - lastBlock >= 1000 && isReels(ig, f)) {
                       lastBlock = now;
-                      performGlobalAction(GLOBAL_ACTION_BACK);
-                      Toast.makeText(this, "Reels/Shorts diblokir", Toast.LENGTH_SHORT).show();
+                      if (now - streakStart > 6000) {
+                          streakStart = now;
+                          blockStreak = 0;
+                      }
+                      blockStreak++;
+                      if (blockStreak > 4) {
+                          pauseUntil = now + 10000;
+                          blockStreak = 0;
+                      } else {
+                          blocks++;
+                          main.post(new Runnable() {
+                              @Override
+                              public void run() {
+                                  performGlobalAction(GLOBAL_ACTION_BACK);
+                                  Toast.makeText(ReelsBlockerService.this, "Reels/Shorts diblokir",
+                                      Toast.LENGTH_SHORT).show();
+                              }
+                          });
+                      }
                   }
               }
 
@@ -342,11 +413,17 @@ jobs:
 
               private void scan(AccessibilityNodeInfo node, int depth, Found f) {
                   if (node == null || depth > 45 || count > 2500) return;
+                  if (depth > 0 && !node.isVisibleToUser()) {
+                      skipped++;
+                      return;
+                  }
                   count++;
                   String id = node.getViewIdResourceName();
+                  String sid = null;
                   if (id != null) {
                       int i = id.indexOf(":id/");
-                      f.ids.add(i >= 0 ? id.substring(i + 4) : id);
+                      sid = i >= 0 ? id.substring(i + 4) : id;
+                      f.ids.add(sid);
                   }
                   CharSequence d = node.getContentDescription();
                   CharSequence t = node.getText();
@@ -354,7 +431,10 @@ jobs:
                   String ts = t == null ? null : t.toString().trim();
                   if (ds != null && ds.length() > 0 && ds.length() <= 30 && f.descs.size() < 80) f.descs.add(ds);
                   if (ts != null && ts.length() > 0 && ts.length() <= 25 && f.texts.size() < 60) f.texts.add(ts);
-                  if (ds != null && ds.length() > 0 && node.isSelected()) f.sel.add(ds);
+                  if (node.isSelected()) {
+                      if (ds != null && ds.length() > 0) f.sel.add(ds);
+                      if (sid != null) f.selIds.add(sid);
+                  }
                   if (isLabel(ds) || isLabel(ts)) {
                       Rect r = clickableBounds(node);
                       f.tabInfo.add((ds != null ? ds : ts) + " sel=" + node.isSelected()
@@ -376,6 +456,7 @@ jobs:
                       if (ig && t.equals("reels")) return true;
                       if (!ig && t.equals("shorts")) return true;
                   }
+                  if (ig && f.selIds.contains("clips_tab")) return true;
                   for (String id : f.ids) {
                       String t = id.toLowerCase();
                       if (ig && t.startsWith("clips_viewer")) return true;
@@ -421,11 +502,13 @@ jobs:
                       wm.addView(v, lp);
                       overlays.add(v);
                   }
+                  hasOverlays = !overlays.isEmpty();
               }
 
               private void clearOverlays() {
                   if (overlays.isEmpty()) {
                       overlayKey = "";
+                      hasOverlays = false;
                       return;
                   }
                   WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
@@ -438,6 +521,7 @@ jobs:
                   }
                   overlays.clear();
                   overlayKey = "";
+                  hasOverlays = false;
               }
 
               @Override
