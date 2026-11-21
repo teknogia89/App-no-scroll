@@ -60,8 +60,8 @@ jobs:
                   applicationId = "com.example.noreels"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 4
-                  versionName = "4.0"
+                  versionCode = 5
+                  versionName = "5.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -105,6 +105,7 @@ jobs:
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
               android:canRetrieveWindowContent="true"
+              android:isAccessibilityTool="true"
               android:notificationTimeout="300"
               android:description="@string/service_description" />
           EOF
@@ -143,9 +144,13 @@ jobs:
           public class ReelsBlockerService extends AccessibilityService {
               static volatile String dumpIg = "(belum ada data Instagram)";
               static volatile String dumpYt = "(belum ada data YouTube)";
+              static volatile String dumpHit = "(belum ada layar dengan id reel/clips/short)";
+              static volatile String winStr = "-";
               static volatile boolean connected = false;
               static volatile int totalEvents = 0;
               static volatile int nullRoot = 0;
+              static volatile int srcNull = 0;
+              static volatile int scans = 0;
               static volatile String lastError = "-";
               static final Map<String, Integer> seen = new ConcurrentHashMap<>();
 
@@ -153,6 +158,8 @@ jobs:
               private String overlayKey = "";
               private long lastRun = 0;
               private long lastBlock = 0;
+              private long lastAppEvent = 0;
+              private long lastWin = 0;
               private int count = 0;
 
               private static class Found {
@@ -166,16 +173,20 @@ jobs:
 
               static String report() {
                   StringBuilder sb = new StringBuilder();
-                  sb.append("v4 connected=").append(connected)
+                  sb.append("v5 connected=").append(connected)
                     .append(" events=").append(totalEvents)
+                    .append(" scans=").append(scans)
                     .append(" nullRoot=").append(nullRoot)
+                    .append(" srcNull=").append(srcNull)
                     .append("\nERR: ").append(lastError)
+                    .append("\nWINS: ").append(winStr)
                     .append("\nPKGS: ");
                   int n = 0;
                   for (Map.Entry<String, Integer> e : new TreeMap<>(seen).entrySet()) {
                       if (n++ >= 40) break;
                       sb.append(e.getKey()).append("=").append(e.getValue()).append(", ");
                   }
+                  sb.append("\n\nHIT: ").append(dumpHit);
                   sb.append("\n\n").append(dumpIg).append("\n\n").append(dumpYt);
                   return sb.toString();
               }
@@ -202,70 +213,109 @@ jobs:
                   }
               }
 
-              private AccessibilityNodeInfo foregroundRoot() {
-                  List<AccessibilityWindowInfo> ws = getWindows();
-                  if (ws != null) {
-                      for (AccessibilityWindowInfo w : ws) {
-                          if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
-                          if (w.isActive() || w.isFocused()) {
-                              AccessibilityNodeInfo r = w.getRoot();
-                              if (r != null) return r;
-                          }
-                      }
+              private AccessibilityNodeInfo topOf(AccessibilityNodeInfo n) {
+                  AccessibilityNodeInfo cur = n;
+                  for (int i = 0; i < 80; i++) {
+                      AccessibilityNodeInfo p = cur.getParent();
+                      if (p == null) break;
+                      cur = p;
                   }
-                  return getRootInActiveWindow();
+                  return cur;
+              }
+
+              private String windowInfo() {
+                  StringBuilder sb = new StringBuilder();
+                  List<AccessibilityWindowInfo> ws = getWindows();
+                  if (ws == null) return "null";
+                  for (AccessibilityWindowInfo w : ws) {
+                      String p = "?";
+                      AccessibilityNodeInfo r = w.getRoot();
+                      if (r != null) {
+                          CharSequence cp = r.getPackageName();
+                          p = cp == null ? "?" : cp.toString();
+                          r.recycle();
+                      }
+                      sb.append("[t").append(w.getType())
+                        .append(w.isActive() ? " A" : "")
+                        .append(w.isFocused() ? " F" : "")
+                        .append(" ").append(p).append("] ");
+                  }
+                  return sb.toString();
               }
 
               private void handle(AccessibilityEvent event) {
                   if (event == null) return;
                   totalEvents++;
                   CharSequence ep = event.getPackageName();
-                  if (ep != null && seen.size() < 200) {
-                      String k = ep.toString();
-                      Integer c = seen.get(k);
-                      seen.put(k, c == null ? 1 : c + 1);
+                  String epk = ep == null ? "" : ep.toString();
+                  if (epk.length() > 0 && seen.size() < 200) {
+                      Integer c = seen.get(epk);
+                      seen.put(epk, c == null ? 1 : c + 1);
                   }
+                  boolean yt = epk.contains("youtube") && !epk.contains("music");
+                  boolean ig = epk.contains("instagram");
                   long now = System.currentTimeMillis();
+
+                  if (!ig && !yt) {
+                      boolean stateChange =
+                          event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
+                      if ((stateChange && !epk.equals(getPackageName())
+                              && !epk.equals("com.android.systemui"))
+                              || now - lastAppEvent > 5000) {
+                          clearOverlays();
+                      }
+                      return;
+                  }
+                  lastAppEvent = now;
                   if (now - lastRun < 400) return;
                   lastRun = now;
 
-                  AccessibilityNodeInfo root = foregroundRoot();
+                  AccessibilityNodeInfo src = event.getSource();
+                  AccessibilityNodeInfo root;
+                  if (src != null) {
+                      root = topOf(src);
+                  } else {
+                      srcNull++;
+                      root = getRootInActiveWindow();
+                  }
                   if (root == null) {
                       nullRoot++;
-                      clearOverlays();
-                      return;
-                  }
-                  CharSequence rp = root.getPackageName();
-                  String pkg = rp == null ? "" : rp.toString();
-                  boolean yt = pkg.contains("youtube") && !pkg.contains("music");
-                  boolean ig = pkg.contains("instagram");
-                  if (!ig && !yt) {
-                      root.recycle();
-                      clearOverlays();
                       return;
                   }
 
                   Found f = new Found();
                   count = 0;
                   scan(root, 0, f);
-                  root.recycle();
+                  scans++;
 
-                  StringBuilder sb = new StringBuilder();
-                  sb.append(pkg).append(" nodes=").append(count)
-                    .append("\nSELECTED: ").append(f.sel)
-                    .append("\nTABS: ").append(f.tabInfo)
-                    .append("\nDESCS: ").append(f.descs)
-                    .append("\nTEXTS: ").append(f.texts)
-                    .append("\nIDS: ");
-                  for (String s : f.ids) sb.append(s).append(", ");
-                  String dump = sb.toString();
-                  if (dump.length() > 7000) dump = dump.substring(0, 7000);
-                  if (ig) dumpIg = dump; else dumpYt = dump;
+                  if (now - lastWin > 3000) {
+                      lastWin = now;
+                      winStr = windowInfo();
+                  }
+
+                  if (count >= 15) {
+                      StringBuilder sb = new StringBuilder();
+                      sb.append(epk).append(" nodes=").append(count)
+                        .append("\nSELECTED: ").append(f.sel)
+                        .append("\nTABS: ").append(f.tabInfo)
+                        .append("\nDESCS: ").append(f.descs)
+                        .append("\nTEXTS: ").append(f.texts)
+                        .append("\nIDS: ");
+                      boolean hit = !f.tabInfo.isEmpty();
+                      for (String s : f.ids) {
+                          sb.append(s).append(", ");
+                          String l = s.toLowerCase();
+                          if (l.contains("reel") || l.contains("clips") || l.contains("short")) hit = true;
+                      }
+                      String dump = sb.toString();
+                      if (dump.length() > 6000) dump = dump.substring(0, 6000);
+                      if (ig) dumpIg = dump; else dumpYt = dump;
+                      if (hit) dumpHit = dump;
+                  }
 
                   updateOverlays(f.rects, yt);
 
-                  if (now - lastBlock < 1000) return;
-                  if (isReels(ig, f)) {
+                  if (now - lastBlock >= 1000 && isReels(ig, f)) {
                       lastBlock = now;
                       performGlobalAction(GLOBAL_ACTION_BACK);
                       Toast.makeText(this, "Reels/Shorts diblokir", Toast.LENGTH_SHORT).show();
