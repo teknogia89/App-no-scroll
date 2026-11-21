@@ -1,4 +1,4 @@
-name: Apk Anti Doom scroll
+name: Build APK
 
 on:
   workflow_dispatch:
@@ -59,9 +59,9 @@ jobs:
               defaultConfig {
                   applicationId = "com.example.noreels"
                   minSdk = 24
-                  targetSdk = 34
-                  versionCode = 7
-                  versionName = "7.0"
+                  targetSdk = 33
+                  versionCode = 9
+                  versionName = "9.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -73,6 +73,9 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
               <application
                   android:label="No Reels"
                   android:theme="@android:style/Theme.Material.Light.DarkActionBar">
@@ -121,10 +124,16 @@ jobs:
           package com.example.noreels;
 
           import android.accessibilityservice.AccessibilityService;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.content.Context;
           import android.content.Intent;
+          import android.content.SharedPreferences;
           import android.content.res.Configuration;
           import android.graphics.PixelFormat;
           import android.graphics.Rect;
+          import android.os.Build;
           import android.os.Handler;
           import android.os.HandlerThread;
           import android.os.Looper;
@@ -136,9 +145,12 @@ jobs:
           import android.view.accessibility.AccessibilityNodeInfo;
           import android.view.accessibility.AccessibilityWindowInfo;
           import android.widget.Toast;
+          import java.text.SimpleDateFormat;
           import java.util.ArrayList;
+          import java.util.Date;
           import java.util.LinkedList;
           import java.util.List;
+          import java.util.Locale;
           import java.util.Map;
           import java.util.Set;
           import java.util.TreeMap;
@@ -156,6 +168,7 @@ jobs:
               static volatile int scans = 0;
               static volatile int blocks = 0;
               static volatile long lastPollMs = 0;
+              static volatile String lastReason = "-";
               static volatile String lastError = "-";
               static final Map<String, Integer> seen = new ConcurrentHashMap<>();
               static final LinkedList<String> evLog = new LinkedList<>();
@@ -178,6 +191,7 @@ jobs:
               private int blockStreak = 0;
               private long lastWin = 0;
               private long lastDiag = 0;
+              private long lastHb = 0;
               private int count = 0;
               private int skipped = 0;
 
@@ -222,15 +236,56 @@ jobs:
                   return 800;
               }
 
+              static String fmt(long t) {
+                  if (t <= 0) return "-";
+                  return new SimpleDateFormat("dd/MM HH:mm:ss", Locale.US).format(new Date(t));
+              }
+
+              static String lifeReport(Context c) {
+                  SharedPreferences sp = c.getSharedPreferences("noreels", Context.MODE_PRIVATE);
+                  return "STARTS=" + sp.getInt("starts", 0)
+                      + " mulai=" + fmt(sp.getLong("start", 0))
+                      + " hidupTerakhir=" + fmt(sp.getLong("hb", 0))
+                      + " berhenti=" + fmt(sp.getLong("stop", 0))
+                      + "\nSEBELUMNYA: " + sp.getString("prev", "-");
+              }
+
+              private SharedPreferences prefs() {
+                  return getSharedPreferences("noreels", Context.MODE_PRIVATE);
+              }
+
+              private void startKeepAlive() {
+                  try {
+                      NotificationManager nm =
+                          (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                      Notification.Builder b;
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          nm.createNotificationChannel(new NotificationChannel(
+                              "noreels", "No Reels", NotificationManager.IMPORTANCE_MIN));
+                          b = new Notification.Builder(this, "noreels");
+                      } else {
+                          b = new Notification.Builder(this);
+                      }
+                      b.setContentTitle("No Reels aktif")
+                       .setContentText("Reels dan Shorts diblokir")
+                       .setSmallIcon(android.R.drawable.ic_dialog_info)
+                       .setOngoing(true);
+                      startForeground(1, b.build());
+                  } catch (Throwable t) {
+                      lastError = "fg: " + t;
+                  }
+              }
+
               static String report() {
                   StringBuilder sb = new StringBuilder();
-                  sb.append("v7 connected=").append(connected)
+                  sb.append("v9 connected=").append(connected)
                     .append(" events=").append(totalEvents)
                     .append(" polls=").append(polls)
                     .append(" scans=").append(scans)
                     .append(" blocks=").append(blocks)
                     .append(" lastPollMs=").append(lastPollMs)
                     .append("\nERR: ").append(lastError)
+                    .append("\nREASON: ").append(lastReason)
                     .append("\nWINS: ").append(winStr)
                     .append("\nPKGS: ");
                   int n = 0;
@@ -250,22 +305,56 @@ jobs:
               @Override
               protected void onServiceConnected() {
                   super.onServiceConnected();
+                  try {
+                      SharedPreferences sp = prefs();
+                      long hb0 = sp.getLong("hb", 0);
+                      long st0 = sp.getLong("stop", 0);
+                      String prev;
+                      if (hb0 > 0 && st0 < hb0) prev = "MATI TIBA-TIBA, terakhir hidup " + fmt(hb0);
+                      else prev = "berhenti normal " + fmt(st0);
+                      long t = System.currentTimeMillis();
+                      sp.edit().putInt("starts", sp.getInt("starts", 0) + 1)
+                        .putLong("start", t).putLong("hb", t).putString("prev", prev).apply();
+                  } catch (Throwable t) {
+                      lastError = "prefs: " + t;
+                  }
                   connected = true;
                   running = true;
+                  startKeepAlive();
                   worker = new HandlerThread("noreels-poll");
                   worker.start();
                   bg = new Handler(worker.getLooper());
                   bg.post(pollTask);
               }
 
+              private void markStop() {
+                  try {
+                      prefs().edit().putLong("stop", System.currentTimeMillis()).apply();
+                  } catch (Throwable t) {
+                      lastError = "stop: " + t;
+                  }
+              }
+
               @Override
               public boolean onUnbind(Intent intent) {
                   running = false;
                   connected = false;
+                  markStop();
+                  try {
+                      stopForeground(true);
+                  } catch (Throwable t) {
+                      lastError = "fg-stop: " + t;
+                  }
                   if (bg != null) bg.removeCallbacksAndMessages(null);
                   if (worker != null) worker.quitSafely();
                   clearOverlays();
                   return super.onUnbind(intent);
+              }
+
+              @Override
+              public void onDestroy() {
+                  markStop();
+                  super.onDestroy();
               }
 
               @Override
@@ -290,7 +379,7 @@ jobs:
                               while (evLog.size() > 6) evLog.removeFirst();
                           }
                       }
-                      if (bg != null && now - lastKick > 250) {
+                      if (bg != null && now - lastKick > 80) {
                           lastKick = now;
                           bg.post(pollOnce);
                       }
@@ -307,13 +396,20 @@ jobs:
               private void poll() {
                   polls++;
                   final long now = System.currentTimeMillis();
+                  if (now - lastHb > 10000) {
+                      lastHb = now;
+                      try {
+                          prefs().edit().putLong("hb", now).apply();
+                      } catch (Throwable t) {
+                          lastError = "hb: " + t;
+                      }
+                  }
                   List<AccessibilityWindowInfo> ws = getWindows();
                   boolean doWin = now - lastWin > 2000;
                   StringBuilder wsb = new StringBuilder();
                   AccessibilityNodeInfo target = null;
                   String tpkg = "";
-                  boolean targetActive = false;
-                  boolean otherActive = false;
+                  boolean targetWasActive = false;
 
                   if (ws != null) {
                       for (AccessibilityWindowInfo w : ws) {
@@ -332,12 +428,18 @@ jobs:
                                  .append(" ").append(p).append("] ");
                           }
                           boolean match = r != null && app && isTarget(p);
-                          if (app && w.isActive() && !match) otherActive = true;
                           if (match) {
-                              if (w.isActive()) targetActive = true;
                               if (target == null) {
                                   target = r;
                                   tpkg = p;
+                                  targetWasActive = w.isActive();
+                                  continue;
+                              }
+                              if (w.isActive() && !targetWasActive) {
+                                  target.recycle();
+                                  target = r;
+                                  tpkg = p;
+                                  targetWasActive = true;
                                   continue;
                               }
                           }
@@ -349,8 +451,7 @@ jobs:
                       winStr = wsb.toString();
                   }
 
-                  if (target == null || (otherActive && !targetActive)) {
-                      if (target != null) target.recycle();
+                  if (target == null) {
                       if (lastKey.length() > 0) {
                           lastKey = "";
                           main.post(new Runnable() {
@@ -368,22 +469,34 @@ jobs:
                   final boolean ig = !yt;
                   String pfx = tpkg + ":id/";
                   boolean reels = false;
+                  String why = "-";
                   List<Rect> rects = new ArrayList<>();
 
                   if (ig) {
                       List<AccessibilityNodeInfo> tab = target.findAccessibilityNodeInfosByViewId(pfx + "clips_tab");
                       if (tab != null) {
                           for (AccessibilityNodeInfo n : tab) {
-                              if (n.isSelected()) reels = true;
+                              if (n.isSelected()) {
+                                  reels = true;
+                                  why = "ig:tab";
+                              }
                               addTabRect(n, rects);
                               n.recycle();
                           }
                       }
-                      if (!reels) reels = anyVisible(target, pfx,
-                          new String[] {"clips_viewer_view_pager", "clips_viewer_video_layout"});
+                      if (!reels && anyVisible(target, pfx, new String[] {
+                              "clips_viewer_view_pager", "clips_viewer_video_layout",
+                              "clips_viewer_container", "root_clips_layout"})) {
+                          reels = true;
+                          why = "ig:ids";
+                      }
                   } else {
-                      if (!reels) reels = anyVisible(target, pfx,
-                          new String[] {"reel_player_page_container", "reel_recycler"});
+                      if (anyVisible(target, pfx, new String[] {
+                              "reel_player_page_container", "reel_recycler",
+                              "reel_channel_bar", "reel_progress_bar"})) {
+                          reels = true;
+                          why = "yt:ids";
+                      }
                   }
                   List<AccessibilityNodeInfo> labels = target.findAccessibilityNodeInfosByText(ig ? "Reels" : "Shorts");
                   if (labels != null) {
@@ -393,14 +506,17 @@ jobs:
                           String ds = d == null ? null : d.toString().trim();
                           String ts = t == null ? null : t.toString().trim();
                           if (isLabel(ds) || isLabel(ts)) {
-                              if (selectedUp(n)) reels = true;
+                              if (!reels && selectedUp(n)) {
+                                  reels = true;
+                                  why = ig ? "ig:label" : "yt:tab";
+                              }
                               addTabRect(n, rects);
                           }
                           n.recycle();
                       }
                   }
 
-                  if (now - lastDiag > 8000 && now >= burstUntil) {
+                  if (now - lastDiag > 5000 && now >= burstUntil) {
                       lastDiag = now;
                       Found f = new Found();
                       count = 0;
@@ -427,7 +543,10 @@ jobs:
                           if (ig) dumpIg = dump; else dumpYt = dump;
                           if (hit) dumpHit = dump;
                       }
-                      if (isReelsFull(ig, f)) reels = true;
+                      if (!reels && isReelsFull(ig, f)) {
+                          reels = true;
+                          why = "full";
+                      }
                   }
                   target.recycle();
 
@@ -451,16 +570,17 @@ jobs:
 
                   if (reels && now >= pauseUntil && now - lastBlock >= 600) {
                       lastBlock = now;
-                      if (now - streakStart > 6000) {
+                      if (now - streakStart > 8000) {
                           streakStart = now;
                           blockStreak = 0;
                       }
                       blockStreak++;
-                      if (blockStreak > 4) {
-                          pauseUntil = now + 10000;
+                      if (blockStreak > 6) {
+                          pauseUntil = now + 8000;
                           blockStreak = 0;
                       } else {
                           blocks++;
+                          lastReason = why;
                           performGlobalAction(GLOBAL_ACTION_BACK);
                           main.post(new Runnable() {
                               @Override
@@ -575,9 +695,10 @@ jobs:
                   if (ig && f.selIds.contains("clips_tab")) return true;
                   for (String id : f.ids) {
                       String t = id.toLowerCase();
-                      if (ig && t.startsWith("clips_viewer")) return true;
+                      if (ig && (t.startsWith("clips_viewer") || t.equals("root_clips_layout"))) return true;
                       if (!ig && (t.startsWith("reel_player") || t.startsWith("reel_recycler")
-                              || t.startsWith("reel_watch") || t.startsWith("shorts_player")
+                              || t.startsWith("reel_watch") || t.startsWith("reel_channel_bar")
+                              || t.startsWith("reel_progress_bar") || t.startsWith("shorts_player")
                               || t.startsWith("shorts_container"))) return true;
                   }
                   return false;
@@ -650,8 +771,12 @@ jobs:
           import android.content.ClipboardManager;
           import android.content.Context;
           import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
           import android.os.Bundle;
+          import android.os.Handler;
           import android.provider.Settings;
+          import android.view.View;
           import android.widget.Button;
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
@@ -660,28 +785,65 @@ jobs:
 
           public class MainActivity extends Activity {
               private TextView status;
+              private final Handler h = new Handler();
+              private final Runnable tick = new Runnable() {
+                  @Override
+                  public void run() {
+                      refresh();
+                      h.postDelayed(this, 2000);
+                  }
+              };
+
+              private String fullText() {
+                  String head = ReelsBlockerService.connected
+                      ? "STATUS: LAYANAN AKTIF"
+                      : "STATUS: LAYANAN MATI - matikan lalu nyalakan lagi di Aksesibilitas";
+                  return head + "\n" + ReelsBlockerService.lifeReport(this)
+                      + "\n\n" + ReelsBlockerService.report();
+              }
+
+              private void refresh() {
+                  status.setText(fullText());
+              }
+
+              private void add(LinearLayout l, String text, View.OnClickListener c) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setOnClickListener(c);
+                  l.addView(b);
+              }
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(new String[] {"android.permission.POST_NOTIFICATIONS"}, 1);
+                  }
                   ScrollView scroll = new ScrollView(this);
                   LinearLayout layout = new LinearLayout(this);
                   layout.setOrientation(LinearLayout.VERTICAL);
                   layout.setPadding(32, 48, 32, 48);
-                  Button btn = new Button(this);
-                  btn.setText("Buka Pengaturan Aksesibilitas");
-                  btn.setOnClickListener(v ->
+
+                  add(layout, "1. Buka Pengaturan Aksesibilitas", v ->
                       startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
-                  layout.addView(btn);
-                  Button copy = new Button(this);
-                  copy.setText("Salin data layar terakhir");
-                  copy.setOnClickListener(v -> {
+                  add(layout, "2. Hemat baterai: izinkan tanpa batas", v -> {
+                      try {
+                          startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                              Uri.parse("package:" + getPackageName())));
+                      } catch (Exception e) {
+                          startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+                      }
+                  });
+                  add(layout, "3. Info aplikasi (Mulai otomatis, Baterai)", v ->
+                      startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                          Uri.parse("package:" + getPackageName()))));
+                  add(layout, "Salin data layar terakhir", v -> {
                       ClipboardManager cm =
                           (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                      cm.setPrimaryClip(ClipData.newPlainText("dump", ReelsBlockerService.report()));
+                      cm.setPrimaryClip(ClipData.newPlainText("dump", fullText()));
                       Toast.makeText(this, "Tersalin", Toast.LENGTH_SHORT).show();
                   });
-                  layout.addView(copy);
+
                   status = new TextView(this);
                   status.setTextSize(12);
                   status.setTextIsSelectable(true);
@@ -693,7 +855,13 @@ jobs:
               @Override
               protected void onResume() {
                   super.onResume();
-                  status.setText(ReelsBlockerService.report());
+                  h.post(tick);
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  h.removeCallbacks(tick);
               }
           }
           EOF
