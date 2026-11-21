@@ -1,0 +1,215 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Tulis project
+        run: |
+          mkdir -p NoReels/app/src/main/java/com/example/noreels
+          mkdir -p NoReels/app/src/main/res/xml NoReels/app/src/main/res/values
+          cd NoReels
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "NoReels"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+          }
+          android {
+              namespace = "com.example.noreels"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.noreels"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="No Reels"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".ReelsBlockerService"
+                      android:exported="true"
+                      android:label="No Reels &amp; Shorts"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="300"
+              android:packageNames="com.instagram.android,com.google.android.youtube"
+              android:description="@string/service_description" />
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="service_description">Menutup otomatis halaman Reels Instagram dan Shorts YouTube.</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/java/com/example/noreels/ReelsBlockerService.java <<'EOF'
+          package com.example.noreels;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import android.widget.Toast;
+          import java.util.List;
+
+          public class ReelsBlockerService extends AccessibilityService {
+              private static final String IG = "com.instagram.android";
+              private static final String YT = "com.google.android.youtube";
+              private static final String[] IG_IDS = {
+                  "clips_viewer_view_pager", "clips_viewer_video_layout",
+                  "clips_video_container", "root_clips_layout"
+              };
+              private static final String[] YT_IDS = {
+                  "reel_player_page_container", "reel_recycler",
+                  "shorts_player_container", "reel_watch_player"
+              };
+              private long lastBlock = 0;
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+                  if (event == null || event.getPackageName() == null) return;
+                  String pkg = event.getPackageName().toString();
+                  if (!pkg.equals(IG) && !pkg.equals(YT)) return;
+                  long now = System.currentTimeMillis();
+                  if (now - lastBlock < 1000) return;
+                  AccessibilityNodeInfo root = getRootInActiveWindow();
+                  if (root == null) return;
+                  boolean found = hasAny(root, pkg, pkg.equals(IG) ? IG_IDS : YT_IDS);
+                  root.recycle();
+                  if (found) {
+                      lastBlock = now;
+                      performGlobalAction(GLOBAL_ACTION_BACK);
+                      Toast.makeText(this, "Reels/Shorts diblokir", Toast.LENGTH_SHORT).show();
+                  }
+              }
+
+              private boolean hasAny(AccessibilityNodeInfo root, String pkg, String[] ids) {
+                  for (String id : ids) {
+                      List<AccessibilityNodeInfo> nodes =
+                          root.findAccessibilityNodeInfosByViewId(pkg + ":id/" + id);
+                      if (nodes != null && !nodes.isEmpty()) {
+                          for (AccessibilityNodeInfo n : nodes) n.recycle();
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              @Override
+              public void onInterrupt() {}
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/noreels/MainActivity.java <<'EOF'
+          package com.example.noreels;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setGravity(Gravity.CENTER);
+                  layout.setPadding(48, 48, 48, 48);
+                  TextView info = new TextView(this);
+                  info.setTextSize(16);
+                  info.setText("Aktifkan No Reels & Shorts di Pengaturan Aksesibilitas.");
+                  layout.addView(info);
+                  Button btn = new Button(this);
+                  btn.setText("Buka Pengaturan Aksesibilitas");
+                  btn.setOnClickListener(v ->
+                      startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+                  layout.addView(btn);
+                  setContentView(layout);
+              }
+          }
+          EOF
+      - name: Build APK
+        run: cd NoReels && gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NoReels-apk
+          path: NoReels/app/build/outputs/apk/debug/app-debug.apk
